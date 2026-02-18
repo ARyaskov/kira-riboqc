@@ -1,0 +1,47 @@
+[package]
+name = "kira-riboqc"
+description = "Deterministic ribosome and translation-state quality control for single-cell RNA-seq."
+version = "0.1.0"
+rust-version = "1.95"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ARyaskov/kira-riboqc"
+keywords = [
+    "bioinformatics",
+    "ribosome",
+    "translation",
+    "sc-rna",
+    "oncology"
+]
+categories = [
+    "science",
+    "science::bioinformatics",
+    "science::bioinformatics::genomics",
+    "command-line-utilities"
+]
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+csv = "1"
+flate2 = "1"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+scalar = []
+simd = []
+avx2 = []
+neon = []
+
+[[bin]]
+name = "kira-riboqc"
+path = "src/main.rs"
