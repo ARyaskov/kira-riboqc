@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use kira_scio::api::{Reader, ReaderOptions};
+use kira_scio::detect::DetectedFormat;
+
 use super::InputError;
-use super::mtx10x::open_maybe_gz;
 
 #[derive(Debug, Clone)]
 pub struct FeatureRow {
@@ -41,38 +42,30 @@ pub fn normalize_symbol(s: &str) -> String {
 }
 
 pub fn load_features(path: &Path) -> Result<Vec<FeatureRow>, InputError> {
-    let reader = BufReader::new(open_maybe_gz(path)?);
-    let mut rows = Vec::new();
+    let md = Reader::with_options(
+        path,
+        ReaderOptions {
+            force_format: Some(DetectedFormat::Mtx10x),
+            strict: true,
+        },
+    )
+    .read_metadata()
+    .map_err(|e| InputError::Parse(e.message))?;
 
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = trimmed.split('\t').collect();
-        if parts.len() < 2 {
-            return Err(InputError::Parse(
-                "features file must have at least 2 columns".to_string(),
-            ));
-        }
-        let raw_id = parts[0].to_string();
-        let raw_name = parts[1].to_string();
-        let raw_type = if parts.len() >= 3 {
-            parts[2].to_string()
-        } else {
-            String::new()
-        };
-        let norm_symbol = normalize_symbol(&raw_name);
-
+    let mut rows = Vec::with_capacity(md.gene_symbols.len());
+    for (idx, symbol) in md.gene_symbols.iter().enumerate() {
+        let raw_id = md
+            .gene_ids
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| format!("GENE_{}", idx + 1));
         rows.push(FeatureRow {
             raw_id,
-            raw_name,
-            raw_type,
-            norm_symbol,
+            raw_name: symbol.clone(),
+            raw_type: String::new(),
+            norm_symbol: normalize_symbol(symbol),
         });
     }
-
     Ok(rows)
 }
 
