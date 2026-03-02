@@ -77,6 +77,7 @@ fn stage5_pipeline_outputs_written() {
     assert!(summary.get("regimes").is_some());
     assert!(summary.get("qc").is_some());
     assert!(summary.get("translation").is_some());
+    assert!(summary.get("translation_extension").is_some());
 
     let step: Value = serde_json::from_str(&read_to_string(step_path).unwrap()).unwrap();
     assert_eq!(step["tool"]["name"], "kira-riboqc");
@@ -281,4 +282,5 @@ fn stage5_extension_disabled_keeps_legacy_artifacts_stable() {
     let summary: Value =
         serde_json::from_str(&read_to_string(final_dir.join("summary.json")).unwrap()).unwrap();
     assert!(summary.get("translation").is_none());
+    assert!(summary.get("translation_extension").is_none());
 }

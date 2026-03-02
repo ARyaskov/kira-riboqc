@@ -2,6 +2,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 use crate::input::Stage1Stats;
+use crate::metrics::translation_extension::aggregate::TranslationExtensionSummary;
 use crate::pipeline::stage_translation_regime::StageTranslationRegimeOutput;
 use crate::report::pipeline_contract::PipelineCellRow;
 use crate::simd;
@@ -15,6 +16,8 @@ pub struct Summary {
     pub qc: QcSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub translation: Option<TranslationSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub translation_extension: Option<TranslationExtensionSummary>,
 }
 
 #[derive(Serialize)]
@@ -138,6 +141,7 @@ pub fn build_summary(
             mean_translation_commitment: t.mean_translation_commitment,
             high_selective_translation_fraction: t.high_selective_translation_fraction,
         }),
+        translation_extension: stage_translation.map(|t| t.translation_extension_summary.clone()),
     }
 }
 

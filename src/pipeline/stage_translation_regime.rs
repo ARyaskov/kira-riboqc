@@ -4,6 +4,16 @@ use tracing::info;
 
 use crate::core::membership::MembershipVec;
 use crate::input::{InputBundle, SharedCacheData, normalize_symbol};
+use crate::metrics::translation_extension::aggregate::{
+    TranslationExtensionCellSnapshot, TranslationExtensionSummary, aggregate_translation_extension,
+};
+use crate::metrics::translation_extension::panels::{
+    MIN_GENES_PER_PANEL, PANEL_BIOGENESIS, PANEL_INITIATION, PANEL_ISR, PANEL_MTOR,
+    PANEL_PROTEOSTASIS, PANEL_RIBOSOME_CORE,
+};
+use crate::metrics::translation_extension::scores::{
+    PanelCore, TranslationExtensionCellScores, build_scores, robust_baseline, trimmed_mean,
+};
 use crate::model::axes::{OFFSET, SCALE, clamp01};
 use crate::pipeline::stage2_axes::Stage2Output;
 use crate::simd;
@@ -20,6 +30,24 @@ pub struct TranslationRegimeCell {
     pub codon_bias_proxy: f64,
     pub translation_commitment_score: f64,
     pub translation_regime: &'static str,
+    pub ribosome_core: f64,
+    pub initiation_core: f64,
+    pub bio_core: f64,
+    pub mtor_core: f64,
+    pub isr_core: f64,
+    pub proteo_core: f64,
+    pub tpi: f64,
+    pub rbl: f64,
+    pub mtor_p: f64,
+    pub isr_a: f64,
+    pub tpib: f64,
+    pub tsm: f64,
+    pub translation_high: bool,
+    pub biogenesis_high: bool,
+    pub isr_active: bool,
+    pub proteotoxic_risk: bool,
+    pub translational_stress_mode: bool,
+    pub missing_panel_gene_count: u8,
     pub low_confidence: bool,
 }
 
@@ -29,6 +57,7 @@ pub struct StageTranslationRegimeOutput {
     pub regime_fractions: BTreeMap<String, f64>,
     pub mean_translation_commitment: f64,
     pub high_selective_translation_fraction: f64,
+    pub translation_extension_summary: TranslationExtensionSummary,
 }
 
 #[derive(Clone, Copy)]
@@ -139,6 +168,12 @@ struct GeneSets {
     stress_responsive: Vec<u32>,
     isr_like: Vec<u32>,
     codon_suboptimal: Vec<u32>,
+    ext_ribosome_core: Vec<u32>,
+    ext_biogenesis: Vec<u32>,
+    ext_mtor: Vec<u32>,
+    ext_isr: Vec<u32>,
+    ext_initiation: Vec<u32>,
+    ext_proteostasis: Vec<u32>,
 }
 
 pub fn run_stage_translation_regime(
@@ -166,11 +201,26 @@ fn run_stage_translation_regime_with_ln1p(
 
     let sets = resolve_gene_sets(&input.gene_index.map);
 
-    let cov_housekeeping = coverage(sets.housekeeping.len(), HOUSEKEEPING_SET.len());
-    let cov_global = coverage(sets.global_translation.len(), GLOBAL_TRANSLATION_SET.len());
-    let cov_stress = coverage(sets.stress_responsive.len(), STRESS_RESPONSIVE_SET.len());
-    let cov_isr = coverage(sets.isr_like.len(), ISR_LIKE_SET.len());
-    let cov_codon = coverage(sets.codon_suboptimal.len(), CODON_SUBOPTIMAL_SET.len());
+    let cov_housekeeping = coverage(
+        sets.housekeeping.len(),
+        parse_two_column_gene_set(HOUSEKEEPING_SET).len(),
+    );
+    let cov_global = coverage(
+        sets.global_translation.len(),
+        parse_two_column_gene_set(GLOBAL_TRANSLATION_SET).len(),
+    );
+    let cov_stress = coverage(
+        sets.stress_responsive.len(),
+        parse_two_column_gene_set(STRESS_RESPONSIVE_SET).len(),
+    );
+    let cov_isr = coverage(
+        sets.isr_like.len(),
+        parse_two_column_gene_set(ISR_LIKE_SET).len(),
+    );
+    let cov_codon = coverage(
+        sets.codon_suboptimal.len(),
+        parse_two_column_gene_set(CODON_SUBOPTIMAL_SET).len(),
+    );
 
     let low_coverage = cov_housekeeping.low_confidence
         || cov_global.low_confidence
@@ -201,11 +251,28 @@ fn run_stage_translation_regime_with_ln1p(
     let codon_mem =
         MembershipVec::from_gene_ids(&sets.codon_suboptimal, input.gene_index.genes.len());
     let bg_mem = MembershipVec::from_gene_ids(&stage2.bg_gene_ids, input.gene_index.genes.len());
+    let ext_ribosome_mem =
+        MembershipVec::from_gene_ids(&sets.ext_ribosome_core, input.gene_index.genes.len());
+    let ext_initiation_mem =
+        MembershipVec::from_gene_ids(&sets.ext_initiation, input.gene_index.genes.len());
+    let ext_bio_mem =
+        MembershipVec::from_gene_ids(&sets.ext_biogenesis, input.gene_index.genes.len());
+    let ext_mtor_mem = MembershipVec::from_gene_ids(&sets.ext_mtor, input.gene_index.genes.len());
+    let ext_isr_mem = MembershipVec::from_gene_ids(&sets.ext_isr, input.gene_index.genes.len());
+    let ext_proteo_mem =
+        MembershipVec::from_gene_ids(&sets.ext_proteostasis, input.gene_index.genes.len());
 
     let mut cells = Vec::with_capacity(n_cells);
+    let mut ext_panel_cores = Vec::with_capacity(n_cells);
     let mut regime_counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut commitment_sum = 0.0;
     let mut high_selective_count = 0u64;
+    let mut ribosome_values = Vec::with_capacity(sets.ext_ribosome_core.len());
+    let mut initiation_values = Vec::with_capacity(sets.ext_initiation.len());
+    let mut bio_values = Vec::with_capacity(sets.ext_biogenesis.len());
+    let mut mtor_values = Vec::with_capacity(sets.ext_mtor.len());
+    let mut isr_values = Vec::with_capacity(sets.ext_isr.len());
+    let mut proteo_values = Vec::with_capacity(sets.ext_proteostasis.len());
 
     for col in 0..n_cells {
         let col_view = source.column_view(col);
@@ -219,6 +286,12 @@ fn run_stage_translation_regime_with_ln1p(
         let mut acc_isr = Acc::default();
         let mut acc_codon = Acc::default();
         let mut acc_bg = Acc::default();
+        ribosome_values.clear();
+        initiation_values.clear();
+        bio_values.clear();
+        mtor_values.clear();
+        isr_values.clear();
+        proteo_values.clear();
 
         for (gid, val) in col_view.iter(input.gene_index.row_to_gene.as_slice()) {
             let cpm = 1_000_000.0 * (val as f64) / denom;
@@ -244,6 +317,24 @@ fn run_stage_translation_regime_with_ln1p(
             }
             if bg_mem.contains(gid) {
                 acc_bg.add(x);
+            }
+            if ext_ribosome_mem.contains(gid) {
+                ribosome_values.push(x);
+            }
+            if ext_initiation_mem.contains(gid) {
+                initiation_values.push(x);
+            }
+            if ext_bio_mem.contains(gid) {
+                bio_values.push(x);
+            }
+            if ext_mtor_mem.contains(gid) {
+                mtor_values.push(x);
+            }
+            if ext_isr_mem.contains(gid) {
+                isr_values.push(x);
+            }
+            if ext_proteo_mem.contains(gid) {
+                proteo_values.push(x);
             }
         }
 
@@ -291,6 +382,15 @@ fn run_stage_translation_regime_with_ln1p(
             .entry(translation_regime.to_string())
             .or_insert(0) += 1;
 
+        ext_panel_cores.push(PanelCore {
+            ribosome_core: trimmed_mean(&ribosome_values, MIN_GENES_PER_PANEL),
+            initiation_core: trimmed_mean(&initiation_values, MIN_GENES_PER_PANEL),
+            bio_core: trimmed_mean(&bio_values, MIN_GENES_PER_PANEL),
+            mtor_core: trimmed_mean(&mtor_values, MIN_GENES_PER_PANEL),
+            isr_core: trimmed_mean(&isr_values, MIN_GENES_PER_PANEL),
+            proteo_core: trimmed_mean(&proteo_values, MIN_GENES_PER_PANEL),
+        });
+
         cells.push(TranslationRegimeCell {
             cell_id: input.barcodes[col].clone(),
             ribosome_loading_heterogeneity: round6(ribosome_loading_heterogeneity),
@@ -299,9 +399,88 @@ fn run_stage_translation_regime_with_ln1p(
             codon_bias_proxy: round6(codon_bias_proxy),
             translation_commitment_score: round6(translation_commitment_score),
             translation_regime,
+            ribosome_core: f64::NAN,
+            initiation_core: f64::NAN,
+            bio_core: f64::NAN,
+            mtor_core: f64::NAN,
+            isr_core: f64::NAN,
+            proteo_core: f64::NAN,
+            tpi: f64::NAN,
+            rbl: f64::NAN,
+            mtor_p: f64::NAN,
+            isr_a: f64::NAN,
+            tpib: f64::NAN,
+            tsm: f64::NAN,
+            translation_high: false,
+            biogenesis_high: false,
+            isr_active: false,
+            proteotoxic_risk: false,
+            translational_stress_mode: false,
+            missing_panel_gene_count: 0,
             low_confidence: low_coverage,
         });
     }
+
+    let baseline = robust_baseline(&ext_panel_cores);
+    for (cell, core) in cells.iter_mut().zip(ext_panel_cores.iter().copied()) {
+        let ext: TranslationExtensionCellScores = build_scores(core, &baseline);
+        let missing_panel_gene_count = [
+            ext.missing_ribosome_core,
+            ext.missing_initiation_core,
+            ext.missing_bio_core,
+            ext.missing_mtor_core,
+            ext.missing_isr_core,
+            ext.missing_proteo_core,
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count() as u8;
+
+        cell.ribosome_core = round6_nan(ext.ribosome_core);
+        cell.initiation_core = round6_nan(ext.initiation_core);
+        cell.bio_core = round6_nan(ext.bio_core);
+        cell.mtor_core = round6_nan(ext.mtor_core);
+        cell.isr_core = round6_nan(ext.isr_core);
+        cell.proteo_core = round6_nan(ext.proteo_core);
+        cell.tpi = round6_nan(ext.tpi);
+        cell.rbl = round6_nan(ext.rbl);
+        cell.mtor_p = round6_nan(ext.mtor_p);
+        cell.isr_a = round6_nan(ext.isr_a);
+        cell.tpib = round6_nan(ext.tpib);
+        cell.tsm = round6_nan(ext.tsm);
+        cell.translation_high = ext.translation_high;
+        cell.biogenesis_high = ext.biogenesis_high;
+        cell.isr_active = ext.isr_active;
+        cell.proteotoxic_risk = ext.proteotoxic_risk;
+        cell.translational_stress_mode = ext.translational_stress_mode;
+        cell.missing_panel_gene_count = missing_panel_gene_count;
+    }
+
+    let ext_snapshots = cells
+        .iter()
+        .map(|cell| TranslationExtensionCellSnapshot {
+            cell_id: cell.cell_id.clone(),
+            tpi: cell.tpi,
+            rbl: cell.rbl,
+            isr_a: cell.isr_a,
+            tpib: cell.tpib,
+            tsm: cell.tsm,
+            translation_high: cell.translation_high,
+            biogenesis_high: cell.biogenesis_high,
+            isr_active: cell.isr_active,
+            proteotoxic_risk: cell.proteotoxic_risk,
+            translational_stress_mode: cell.translational_stress_mode,
+            missing_ribosome_core: cell.ribosome_core.is_nan(),
+            missing_initiation_core: cell.initiation_core.is_nan(),
+            missing_bio_core: cell.bio_core.is_nan(),
+            missing_mtor_core: cell.mtor_core.is_nan(),
+            missing_isr_core: cell.isr_core.is_nan(),
+            missing_proteo_core: cell.proteo_core.is_nan(),
+        })
+        .collect::<Vec<_>>();
+
+    let translation_extension_summary =
+        aggregate_translation_extension(&ext_snapshots, input.metadata.as_ref());
 
     cells.sort_by(|a, b| a.cell_id.cmp(&b.cell_id));
 
@@ -343,6 +522,7 @@ fn run_stage_translation_regime_with_ln1p(
         regime_fractions,
         mean_translation_commitment,
         high_selective_translation_fraction,
+        translation_extension_summary,
     })
 }
 
@@ -399,6 +579,12 @@ fn resolve_gene_sets(map: &BTreeMap<String, u32>) -> GeneSets {
         stress_responsive: resolve_gene_set_tsv(map, STRESS_RESPONSIVE_SET),
         isr_like: resolve_gene_set_tsv(map, ISR_LIKE_SET),
         codon_suboptimal: resolve_gene_set_tsv(map, CODON_SUBOPTIMAL_SET),
+        ext_ribosome_core: resolve_gene_list(map, PANEL_RIBOSOME_CORE),
+        ext_biogenesis: resolve_gene_list(map, PANEL_BIOGENESIS),
+        ext_mtor: resolve_gene_list(map, PANEL_MTOR),
+        ext_isr: resolve_gene_list(map, PANEL_ISR),
+        ext_initiation: resolve_gene_list(map, PANEL_INITIATION),
+        ext_proteostasis: resolve_gene_list(map, PANEL_PROTEOSTASIS),
     }
 }
 
@@ -439,8 +625,26 @@ fn parse_two_column_gene_set(tsv: &str) -> Vec<(String, String)> {
     rows
 }
 
+fn resolve_gene_list(map: &BTreeMap<String, u32>, symbols: &[&str]) -> Vec<u32> {
+    let mut ids = BTreeSet::new();
+    for symbol in symbols {
+        let normalized = normalize_symbol(symbol);
+        if normalized.is_empty() {
+            continue;
+        }
+        if let Some(id) = map.get(&normalized) {
+            ids.insert(*id);
+        }
+    }
+    ids.into_iter().collect()
+}
+
 fn round6(x: f64) -> f64 {
     (x * 1_000_000.0).round() / 1_000_000.0
+}
+
+fn round6_nan(x: f64) -> f64 {
+    if x.is_nan() { f64::NAN } else { round6(x) }
 }
 
 const HOUSEKEEPING_SET: &str = include_str!(concat!(
@@ -472,6 +676,13 @@ const RIBOSOME_CORE_SET: &str = include_str!(concat!(
 mod tests {
     use super::*;
     use crate::input::{CscMatrix, FeatureRow, InputFormat, build_gene_index};
+
+    fn assert_f64_eq_or_nan(a: f64, b: f64) {
+        if a.is_nan() && b.is_nan() {
+            return;
+        }
+        assert_eq!(a, b);
+    }
 
     fn synthetic_input() -> (InputBundle, Stage2Output) {
         let symbols = [
@@ -545,24 +756,47 @@ mod tests {
         assert_eq!(a.cells.len(), b.cells.len());
         for i in 0..a.cells.len() {
             assert_eq!(a.cells[i].cell_id, b.cells[i].cell_id);
-            assert_eq!(
+            assert_f64_eq_or_nan(
                 a.cells[i].ribosome_loading_heterogeneity,
-                b.cells[i].ribosome_loading_heterogeneity
+                b.cells[i].ribosome_loading_heterogeneity,
             );
-            assert_eq!(
+            assert_f64_eq_or_nan(
                 a.cells[i].translation_selectivity_index,
-                b.cells[i].translation_selectivity_index
+                b.cells[i].translation_selectivity_index,
             );
-            assert_eq!(
+            assert_f64_eq_or_nan(
                 a.cells[i].isr_like_signature_score,
-                b.cells[i].isr_like_signature_score
+                b.cells[i].isr_like_signature_score,
             );
-            assert_eq!(a.cells[i].codon_bias_proxy, b.cells[i].codon_bias_proxy);
-            assert_eq!(
+            assert_f64_eq_or_nan(a.cells[i].codon_bias_proxy, b.cells[i].codon_bias_proxy);
+            assert_f64_eq_or_nan(
                 a.cells[i].translation_commitment_score,
-                b.cells[i].translation_commitment_score
+                b.cells[i].translation_commitment_score,
             );
             assert_eq!(a.cells[i].translation_regime, b.cells[i].translation_regime);
+            assert_f64_eq_or_nan(a.cells[i].ribosome_core, b.cells[i].ribosome_core);
+            assert_f64_eq_or_nan(a.cells[i].initiation_core, b.cells[i].initiation_core);
+            assert_f64_eq_or_nan(a.cells[i].bio_core, b.cells[i].bio_core);
+            assert_f64_eq_or_nan(a.cells[i].mtor_core, b.cells[i].mtor_core);
+            assert_f64_eq_or_nan(a.cells[i].isr_core, b.cells[i].isr_core);
+            assert_f64_eq_or_nan(a.cells[i].tpi, b.cells[i].tpi);
+            assert_f64_eq_or_nan(a.cells[i].rbl, b.cells[i].rbl);
+            assert_f64_eq_or_nan(a.cells[i].mtor_p, b.cells[i].mtor_p);
+            assert_f64_eq_or_nan(a.cells[i].isr_a, b.cells[i].isr_a);
+            assert_f64_eq_or_nan(a.cells[i].tpib, b.cells[i].tpib);
+            assert_f64_eq_or_nan(a.cells[i].tsm, b.cells[i].tsm);
+            assert_eq!(a.cells[i].translation_high, b.cells[i].translation_high);
+            assert_eq!(a.cells[i].biogenesis_high, b.cells[i].biogenesis_high);
+            assert_eq!(a.cells[i].isr_active, b.cells[i].isr_active);
+            assert_eq!(a.cells[i].proteotoxic_risk, b.cells[i].proteotoxic_risk);
+            assert_eq!(
+                a.cells[i].translational_stress_mode,
+                b.cells[i].translational_stress_mode
+            );
+            assert_eq!(
+                a.cells[i].missing_panel_gene_count,
+                b.cells[i].missing_panel_gene_count
+            );
         }
 
         assert_eq!(a.regime_fractions, b.regime_fractions);
@@ -570,6 +804,10 @@ mod tests {
         assert_eq!(
             a.high_selective_translation_fraction,
             b.high_selective_translation_fraction
+        );
+        assert_eq!(
+            serde_json::to_string(&a.translation_extension_summary).unwrap(),
+            serde_json::to_string(&b.translation_extension_summary).unwrap()
         );
     }
 
@@ -608,21 +846,23 @@ mod tests {
             let a = &simd_out.cells[i];
             let b = &scalar_out.cells[i];
             assert_eq!(a.cell_id, b.cell_id);
-            assert_eq!(
+            assert_f64_eq_or_nan(
                 a.ribosome_loading_heterogeneity,
-                b.ribosome_loading_heterogeneity
+                b.ribosome_loading_heterogeneity,
             );
-            assert_eq!(
+            assert_f64_eq_or_nan(
                 a.translation_selectivity_index,
-                b.translation_selectivity_index
+                b.translation_selectivity_index,
             );
-            assert_eq!(a.isr_like_signature_score, b.isr_like_signature_score);
-            assert_eq!(a.codon_bias_proxy, b.codon_bias_proxy);
-            assert_eq!(
+            assert_f64_eq_or_nan(a.isr_like_signature_score, b.isr_like_signature_score);
+            assert_f64_eq_or_nan(a.codon_bias_proxy, b.codon_bias_proxy);
+            assert_f64_eq_or_nan(
                 a.translation_commitment_score,
-                b.translation_commitment_score
+                b.translation_commitment_score,
             );
             assert_eq!(a.translation_regime, b.translation_regime);
+            assert_f64_eq_or_nan(a.tpi, b.tpi);
+            assert_f64_eq_or_nan(a.tsm, b.tsm);
         }
     }
 }

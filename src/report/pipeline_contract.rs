@@ -1,7 +1,9 @@
 use crate::input::InputBundle;
 use crate::model::axes::clamp01;
 use crate::model::classification::TranslationRegime;
-use crate::pipeline::stage_translation_regime::StageTranslationRegimeOutput;
+use crate::pipeline::stage_translation_regime::{
+    StageTranslationRegimeOutput, TranslationRegimeCell,
+};
 use crate::pipeline::stage2_axes::Stage2Output;
 use crate::pipeline::stage3_scores::Stage3Output;
 use crate::pipeline::stage4_classify::Stage4Output;
@@ -21,6 +23,22 @@ pub struct PipelineCellRow {
     pub initiation_bias: f64,
     pub ribosomal_specialization: f64,
     pub stress_translation_index: f64,
+    pub ribosome_core: f64,
+    pub initiation_core: f64,
+    pub bio_core: f64,
+    pub mtor_core: f64,
+    pub isr_core: f64,
+    pub tpi: f64,
+    pub rbl: f64,
+    pub mtor_p: f64,
+    pub isr_a: f64,
+    pub tpib: f64,
+    pub tsm: f64,
+    pub translation_high: bool,
+    pub biogenesis_high: bool,
+    pub isr_active: bool,
+    pub proteotoxic_risk: bool,
+    pub translational_stress_mode: bool,
     pub regime: &'static str,
     pub flags: String,
     pub confidence: f64,
@@ -37,14 +55,10 @@ pub fn build_pipeline_rows(
 ) -> Vec<PipelineCellRow> {
     let species = infer_species(input);
     let mut rows = Vec::with_capacity(input.barcodes.len());
-    let translation_low_conf: std::collections::BTreeMap<&str, bool> = stage_translation
-        .map(|s| {
-            s.cells
-                .iter()
-                .map(|c| (c.cell_id.as_str(), c.low_confidence))
-                .collect()
-        })
-        .unwrap_or_default();
+    let translation_cells: std::collections::BTreeMap<&str, &TranslationRegimeCell> =
+        stage_translation
+            .map(|s| s.cells.iter().map(|c| (c.cell_id.as_str(), c)).collect())
+            .unwrap_or_default();
 
     for i in 0..input.barcodes.len() {
         let barcode = input.barcodes[i].clone();
@@ -64,6 +78,7 @@ pub fn build_pipeline_rows(
         let initiation_bias = nan_to_zero(stage2.components[i].mach);
         let ribosomal_specialization = nan_to_zero(stage2.axes[i].rqc);
         let stress_translation_index = nan_to_zero(stage2.axes[i].st);
+        let tcell = translation_cells.get(barcode.as_str()).copied();
 
         let regime = map_regime(stage4.classification[i].regime, translation_load);
 
@@ -77,12 +92,23 @@ pub fn build_pipeline_rows(
         if stage2.axes[i].st_low_confidence {
             flags.push("LOW_CONFIDENCE");
         }
-        if translation_low_conf
-            .get(barcode.as_str())
-            .copied()
-            .unwrap_or(false)
-        {
+        if tcell.map(|c| c.low_confidence).unwrap_or(false) {
             flags.push("LOW_CONFIDENCE");
+        }
+        if tcell.map(|c| c.translation_high).unwrap_or(false) {
+            flags.push("TRANSLATION_HIGH");
+        }
+        if tcell.map(|c| c.biogenesis_high).unwrap_or(false) {
+            flags.push("BIOGENESIS_HIGH");
+        }
+        if tcell.map(|c| c.isr_active).unwrap_or(false) {
+            flags.push("ISR_ACTIVE");
+        }
+        if tcell.map(|c| c.proteotoxic_risk).unwrap_or(false) {
+            flags.push("PROTEOTOXIC_RISK");
+        }
+        if tcell.map(|c| c.translational_stress_mode).unwrap_or(false) {
+            flags.push("TRANSLATIONAL_STRESS_MODE");
         }
         let low_ribo_signal = ribosome_density < 0.2;
         if low_ribo_signal {
@@ -117,6 +143,22 @@ pub fn build_pipeline_rows(
             initiation_bias,
             ribosomal_specialization,
             stress_translation_index,
+            ribosome_core: tcell.map(|c| c.ribosome_core).unwrap_or(f64::NAN),
+            initiation_core: tcell.map(|c| c.initiation_core).unwrap_or(f64::NAN),
+            bio_core: tcell.map(|c| c.bio_core).unwrap_or(f64::NAN),
+            mtor_core: tcell.map(|c| c.mtor_core).unwrap_or(f64::NAN),
+            isr_core: tcell.map(|c| c.isr_core).unwrap_or(f64::NAN),
+            tpi: tcell.map(|c| c.tpi).unwrap_or(f64::NAN),
+            rbl: tcell.map(|c| c.rbl).unwrap_or(f64::NAN),
+            mtor_p: tcell.map(|c| c.mtor_p).unwrap_or(f64::NAN),
+            isr_a: tcell.map(|c| c.isr_a).unwrap_or(f64::NAN),
+            tpib: tcell.map(|c| c.tpib).unwrap_or(f64::NAN),
+            tsm: tcell.map(|c| c.tsm).unwrap_or(f64::NAN),
+            translation_high: tcell.map(|c| c.translation_high).unwrap_or(false),
+            biogenesis_high: tcell.map(|c| c.biogenesis_high).unwrap_or(false),
+            isr_active: tcell.map(|c| c.isr_active).unwrap_or(false),
+            proteotoxic_risk: tcell.map(|c| c.proteotoxic_risk).unwrap_or(false),
+            translational_stress_mode: tcell.map(|c| c.translational_stress_mode).unwrap_or(false),
             regime,
             flags: flags.join(","),
             confidence,

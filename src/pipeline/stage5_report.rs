@@ -29,7 +29,12 @@ pub fn run_stage5(
     let _span = tracing::info_span!("stage5_report").entered();
     info!("Stage 5 start");
 
-    let target_dir = if matches!(run_mode, RunMode::Pipeline) {
+    let target_dir = if matches!(run_mode, RunMode::Pipeline)
+        && out_dir
+            .file_name()
+            .and_then(|v| v.to_str())
+            .is_some_and(|v| v != "kira-riboqc")
+    {
         out_dir.join("kira-riboqc")
     } else {
         out_dir.to_path_buf()

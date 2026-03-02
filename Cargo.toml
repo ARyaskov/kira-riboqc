@@ -1,7 +1,7 @@
 [package]
 name = "kira-riboqc"
 description = "Deterministic ribosome and translation-state quality control for single-cell RNA-seq."
-version = "0.1.1"
+version = "0.1.2"
 rust-version = "1.95"
 edition = "2024"
 license = "MIT"

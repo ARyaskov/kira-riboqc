@@ -189,6 +189,47 @@ Run-level translation summary:
 - `mean_translation_commitment = mean(translation_commitment_score)`
 - `high_selective_translation_fraction = frac(translation_selectivity_index >= 0.65)`
 
+### Translation Extension V1 Proxies
+
+Panel version:
+- `RIBO_EXTENSION_PANEL_V1`
+
+Panels:
+- Cytosolic ribosome core: `RPL3,RPL5,RPL7,RPL10,RPL11,RPL23,RPS3,RPS6,RPS8,RPS14,RPS18`
+- Ribosome biogenesis: `NCL,NPM1,FBL,DKC1,UBTF,POLR1A,POLR1B,WDR12,PES1,BOP1`
+- mTOR proxy: `MTOR,RPTOR,MLST8,RPS6KB1,EIF4EBP1,AKT1`
+- ISR axis: `EIF2AK3,EIF2AK4,ATF4,DDIT3,PPP1R15A`
+- Initiation/elongation: `EIF4E,EIF4G1,EIF3A,EIF3B,EEF1A1,EEF2`
+- Proteostasis interface: `HSPA5,HSP90AA1,HSPB1,PSMA1,PSMB5`
+
+Core panel statistic (per cell):
+- panel value = 10% trimmed mean on panel `x(g,c)` values.
+- if mapped genes `< 3`, panel value is `NaN`.
+
+Robust normalization:
+- `z = (value - median) / (1.4826 * MAD + eps)`, `eps=1e-9`
+- if `MAD == 0`, `z = 0`
+- if panel value is `NaN`, downstream dependent metric is `NaN`
+
+Derived metrics:
+- `TPI = 0.7*Z(ribosome_core) + 0.3*Z(initiation_core)`
+- `RBL = Z(bio_core)`
+- `mTOR_P = 0.6*Z(mtor_core) + 0.4*Z(ribosome_core)`
+- `ISR_A = Z(isr_core)`
+- `TPIB = max(0, TPI - Z(proteostasis_core))`; if proteostasis missing, fallback `max(0,TPI)`
+- `TSM = 0.5*TPI + 0.3*ISR_A + 0.2*TPIB`
+
+Flags:
+- `translation_high: TPI >= 2.0`
+- `biogenesis_high: RBL >= 2.0`
+- `isr_active: ISR_A >= 1.5`
+- `proteotoxic_risk: TPIB >= 1.5`
+- `translational_stress_mode: TSM >= 2.0`
+
+Caveats:
+- These are transcriptional proxies, not direct ribosome profiling.
+- Interpret strongest with orthogonal QC context (especially proteostasis/mitochondrial modules).
+
 ## Output Contracts
 
 ## `riboqc.tsv`
@@ -196,7 +237,11 @@ Run-level translation summary:
 Header:
 - `barcode`, `sample`, `condition`, `species`, `libsize`, `nnz`, `expressed_genes`,
   `translation_load`, `ribosome_density`, `elongation_pressure`, `initiation_bias`,
-  `ribosomal_specialization`, `stress_translation_index`, `regime`, `flags`, `confidence`
+  `ribosomal_specialization`, `stress_translation_index`,
+  `ribosome_core`, `initiation_core`, `bio_core`, `mtor_core`, `isr_core`,
+  `TPI`, `RBL`, `mTOR_P`, `ISR_A`, `TPIB`, `TSM`,
+  `translation_high`, `biogenesis_high`, `isr_active`, `proteotoxic_risk`, `translational_stress_mode`,
+  `regime`, `flags`, `confidence`
 
 Formatting:
 - numeric metric columns emitted with 6 decimals.
@@ -207,7 +252,10 @@ Formatting:
 Header:
 - `cell_id`, `ribosome_loading_heterogeneity`, `translation_selectivity_index`,
   `isr_like_signature_score`, `codon_bias_proxy`, `translation_commitment_score`,
-  `translation_regime`
+  `ribosome_core`, `initiation_core`, `bio_core`, `mtor_core`, `isr_core`,
+  `TPI`, `RBL`, `mTOR_P`, `ISR_A`, `TPIB`, `TSM`,
+  `translation_high`, `biogenesis_high`, `isr_active`, `proteotoxic_risk`, `translational_stress_mode`,
+  `missing_panel_gene_count`, `translation_regime`
 
 Formatting:
 - numeric metric columns emitted with 6 decimals.
@@ -237,6 +285,12 @@ Object fields:
   - `regime_fractions`
   - `mean_translation_commitment`
   - `high_selective_translation_fraction`
+- optional `translation_extension`:
+  - `panel_version`
+  - `thresholds`
+  - `global_stats`
+  - `cluster_stats`
+  - `missingness`
 
 Percentile rule:
 - nearest-rank with `rank = ceil(p*N)`, index `rank-1`, finite-safe sorting (non-finite treated as `0`).
