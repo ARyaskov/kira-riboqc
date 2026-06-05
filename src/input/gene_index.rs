@@ -1,10 +1,4 @@
-use std::collections::BTreeMap;
-use std::path::Path;
-
-use kira_scio::api::{Reader, ReaderOptions};
-use kira_scio::detect::DetectedFormat;
-
-use super::InputError;
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone)]
 pub struct FeatureRow {
@@ -14,10 +8,22 @@ pub struct FeatureRow {
     pub norm_symbol: String,
 }
 
+impl FeatureRow {
+    pub fn from_raw(raw_id: String, raw_name: String) -> Self {
+        let norm_symbol = normalize_symbol(&raw_name);
+        Self {
+            raw_id,
+            raw_name,
+            raw_type: String::new(),
+            norm_symbol,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GeneIndex {
     pub genes: Vec<GeneEntry>,
-    pub map: BTreeMap<String, u32>,
+    pub map: FxHashMap<String, u32>,
     pub row_to_gene: Vec<u32>,
     pub duplicates: Vec<DuplicateGene>,
 }
@@ -37,42 +43,25 @@ pub struct DuplicateGene {
 }
 
 pub fn normalize_symbol(s: &str) -> String {
-    let collapsed = s.trim().split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = s.trim();
+    let needs_collapse = trimmed
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b' ' && w[1] == b' ');
+    let collapsed = if needs_collapse {
+        trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        trimmed.to_string()
+    };
     collapsed.to_ascii_uppercase()
 }
 
-pub fn load_features(path: &Path) -> Result<Vec<FeatureRow>, InputError> {
-    let md = Reader::with_options(
-        path,
-        ReaderOptions {
-            force_format: Some(DetectedFormat::Mtx10x),
-            strict: true,
-        },
-    )
-    .read_metadata()
-    .map_err(|e| InputError::Parse(e.message))?;
-
-    let mut rows = Vec::with_capacity(md.gene_symbols.len());
-    for (idx, symbol) in md.gene_symbols.iter().enumerate() {
-        let raw_id = md
-            .gene_ids
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| format!("GENE_{}", idx + 1));
-        rows.push(FeatureRow {
-            raw_id,
-            raw_name: symbol.clone(),
-            raw_type: String::new(),
-            norm_symbol: normalize_symbol(symbol),
-        });
-    }
-    Ok(rows)
-}
-
 pub fn build_gene_index(features: &[FeatureRow]) -> GeneIndex {
-    let mut genes: Vec<GeneEntry> = Vec::new();
-    let mut map: BTreeMap<String, u32> = BTreeMap::new();
-    let mut row_to_gene = Vec::with_capacity(features.len());
+    let n = features.len();
+    let mut genes: Vec<GeneEntry> = Vec::with_capacity(n);
+    let mut map: FxHashMap<String, u32> =
+        FxHashMap::with_capacity_and_hasher(n, Default::default());
+    let mut row_to_gene = Vec::with_capacity(n);
     let mut duplicates = Vec::new();
 
     for (i, row) in features.iter().enumerate() {
@@ -103,4 +92,11 @@ pub fn build_gene_index(features: &[FeatureRow]) -> GeneIndex {
         row_to_gene,
         duplicates,
     }
+}
+
+pub fn resolve_gene_ids(map: &FxHashMap<String, u32>, symbols: &[&str]) -> Vec<u32> {
+    symbols
+        .iter()
+        .filter_map(|s| map.get(*s).copied())
+        .collect()
 }

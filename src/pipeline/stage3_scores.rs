@@ -1,5 +1,8 @@
+use std::fmt::Write;
+
 use tracing::info;
 
+use crate::core::math::median_non_nan;
 use crate::model::scores::{fragility_from_tpc, lfti, ras, tss};
 use crate::pipeline::stage2_axes::Stage2Output;
 
@@ -40,17 +43,13 @@ pub fn run_stage3(stage2: &Stage2Output) -> anyhow::Result<Stage3Output> {
             red_flags += 1;
         }
 
-        let tss_explain = explain(vec![
-            ("TL", 0.45 * tl),
-            ("RQC", 0.35 * rqc),
-            ("ST", 0.20 * st),
-        ]);
-        let lfti_explain = explain(vec![
+        let tss_explain = explain(&[("TL", 0.45 * tl), ("RQC", 0.35 * rqc), ("ST", 0.20 * st)]);
+        let lfti_explain = explain(&[
             ("RQC", 0.40 * rqc),
             ("ST", 0.35 * st),
             ("fragility", 0.25 * fragility),
         ]);
-        let ras_explain = explain(vec![
+        let ras_explain = explain(&[
             ("TL", 0.50 * tl),
             ("RQC", 0.30 * rqc),
             ("fragility", 0.20 * fragility),
@@ -88,46 +87,25 @@ pub fn run_stage3(stage2: &Stage2Output) -> anyhow::Result<Stage3Output> {
     Ok(Stage3Output { scores })
 }
 
-pub fn explain(components: Vec<(&str, f64)>) -> String {
-    let mut parts: Vec<(&str, f64, f64)> = components
-        .into_iter()
-        .map(|(name, value)| (name, value, value.abs()))
-        .collect();
-
-    parts.sort_by(|a, b| {
-        b.2.partial_cmp(&a.2)
+pub fn explain(components: &[(&str, f64)]) -> String {
+    let mut parts: [(&str, f64); 4] = [("", 0.0); 4];
+    let n = components.len().min(parts.len());
+    parts[..n].copy_from_slice(&components[..n]);
+    parts[..n].sort_by(|a, b| {
+        b.1.abs()
+            .partial_cmp(&a.1.abs())
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(b.0))
     });
 
-    let mut out = String::new();
-    for (idx, (name, value, _abs)) in parts.iter().enumerate() {
+    let mut out = String::with_capacity(48);
+    for (idx, (name, value)) in parts[..n].iter().enumerate() {
         if idx > 0 {
             out.push(' ');
         }
-        let sign = if *value < 0.0 { '-' } else { '+' };
-        out.push(sign);
+        out.push(if *value < 0.0 { '-' } else { '+' });
         out.push_str(name);
-        out.push('(');
-        out.push_str(&format!("{:.2}", value.abs()));
-        out.push(')');
+        let _ = write!(out, "({:.2})", value.abs());
     }
     out
-}
-
-fn median_non_nan<I>(iter: I) -> f64
-where
-    I: Iterator<Item = f64>,
-{
-    let mut values: Vec<f64> = iter.filter(|v| !v.is_nan()).collect();
-    if values.is_empty() {
-        return f64::NAN;
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mid = values.len() / 2;
-    if values.len() % 2 == 1 {
-        values[mid]
-    } else {
-        (values[mid - 1] + values[mid]) / 2.0
-    }
 }

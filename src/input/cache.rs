@@ -1,43 +1,82 @@
-use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use memmap2::Mmap;
+use kira_shared_sc_cache::SharedCacheMmap;
 
 use super::InputError;
 
-#[derive(Debug, Clone)]
 pub struct SharedCacheData {
-    pub path: std::path::PathBuf,
-    pub n_genes: u64,
-    pub n_cells: u64,
-    pub nnz: u64,
-    pub genes: Vec<String>,
-    pub barcodes: Vec<String>,
-    pub col_ptr: Vec<u64>,
-    pub row_idx: Vec<u32>,
-    pub values_u32: Vec<u32>,
-    pub mmap: Arc<Mmap>,
+    pub path: PathBuf,
+    inner: Arc<SharedCacheMmap>,
+}
+
+impl SharedCacheData {
+    #[inline]
+    pub fn n_genes(&self) -> usize {
+        self.inner.n_genes
+    }
+
+    #[inline]
+    pub fn n_cells(&self) -> usize {
+        self.inner.n_cells
+    }
+
+    #[inline]
+    pub fn nnz(&self) -> usize {
+        self.inner.nnz
+    }
+
+    #[inline]
+    pub fn genes(&self) -> &[String] {
+        &self.inner.genes
+    }
+
+    #[inline]
+    pub fn barcodes(&self) -> &[String] {
+        &self.inner.barcodes
+    }
+
+    #[inline]
+    pub fn col_ptr(&self) -> &[u64] {
+        self.inner.col_ptr()
+    }
+
+    #[inline]
+    pub fn row_idx(&self) -> &[u32] {
+        self.inner.row_idx()
+    }
+
+    #[inline]
+    pub fn values_u32(&self) -> &[u32] {
+        self.inner.values_u32()
+    }
+}
+
+impl std::fmt::Debug for SharedCacheData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedCacheData")
+            .field("path", &self.path)
+            .field("n_genes", &self.n_genes())
+            .field("n_cells", &self.n_cells())
+            .field("nnz", &self.nnz())
+            .finish()
+    }
+}
+
+impl Clone for SharedCacheData {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 pub fn read_shared_cache(path: &Path) -> Result<SharedCacheData, InputError> {
-    let shared = kira_shared_sc_cache::read_shared_cache_owned(path).map_err(map_err)?;
-
-    let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file) }
-        .map_err(|e| InputError::Parse(format!("failed to mmap cache file: {e}")))?;
-
+    let mapped = kira_shared_sc_cache::mmap_shared_cache(path).map_err(map_err)?;
     Ok(SharedCacheData {
-        path: shared.path,
-        n_genes: shared.n_genes,
-        n_cells: shared.n_cells,
-        nnz: shared.nnz,
-        genes: shared.genes,
-        barcodes: shared.barcodes,
-        col_ptr: shared.col_ptr,
-        row_idx: shared.row_idx,
-        values_u32: shared.values_u32,
-        mmap: Arc::new(mmap),
+        path: path.to_path_buf(),
+        inner: Arc::new(mapped),
     })
 }
 

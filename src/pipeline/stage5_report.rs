@@ -16,6 +16,7 @@ use crate::report::pipeline_step::write_pipeline_step;
 use crate::report::summary::build_summary;
 use crate::report::tsv::{write_riboqc_tsv, write_translation_regime_tsv};
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_stage5(
     out_dir: &Path,
     run_mode: RunMode,

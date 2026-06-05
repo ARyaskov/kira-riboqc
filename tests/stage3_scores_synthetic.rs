@@ -52,6 +52,6 @@ fn deterministic_scores() {
 
 #[test]
 fn explainability_format() {
-    let out = explain(vec![("A", 0.2), ("B", 0.5), ("C", 0.5)]);
+    let out = explain(&[("A", 0.2), ("B", 0.5), ("C", 0.5)]);
     assert_eq!(out, "+B(0.50) +C(0.50) +A(0.20)");
 }

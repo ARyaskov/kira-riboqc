@@ -1,3 +1,5 @@
+use rustc_hash::FxHashMap;
+
 use crate::input::InputBundle;
 use crate::model::axes::clamp01;
 use crate::model::classification::TranslationRegime;
@@ -46,6 +48,30 @@ pub struct PipelineCellRow {
     pub has_low_ribo_signal: bool,
 }
 
+const FLAG_LOW_COUNTS: u32 = 1 << 0;
+const FLAG_FEW_DETECTED: u32 = 1 << 1;
+const FLAG_LOW_CONFIDENCE: u32 = 1 << 2;
+const FLAG_TRANSLATION_HIGH: u32 = 1 << 3;
+const FLAG_BIOGENESIS_HIGH: u32 = 1 << 4;
+const FLAG_ISR_ACTIVE: u32 = 1 << 5;
+const FLAG_PROTEOTOXIC_RISK: u32 = 1 << 6;
+const FLAG_TRANSLATIONAL_STRESS: u32 = 1 << 7;
+const FLAG_LOW_RIBO_SIGNAL: u32 = 1 << 8;
+const FLAG_RAS_RED_FLAG: u32 = 1 << 9;
+
+const FLAGS: &[(u32, &str)] = &[
+    (FLAG_BIOGENESIS_HIGH, "BIOGENESIS_HIGH"),
+    (FLAG_FEW_DETECTED, "FEW_DETECTED_GENES"),
+    (FLAG_ISR_ACTIVE, "ISR_ACTIVE"),
+    (FLAG_LOW_CONFIDENCE, "LOW_CONFIDENCE"),
+    (FLAG_LOW_COUNTS, "LOW_COUNTS_CELL"),
+    (FLAG_LOW_RIBO_SIGNAL, "LOW_RIBO_SIGNAL"),
+    (FLAG_PROTEOTOXIC_RISK, "PROTEOTOXIC_RISK"),
+    (FLAG_RAS_RED_FLAG, "RAS_RED_FLAG"),
+    (FLAG_TRANSLATIONAL_STRESS, "TRANSLATIONAL_STRESS_MODE"),
+    (FLAG_TRANSLATION_HIGH, "TRANSLATION_HIGH"),
+];
+
 pub fn build_pipeline_rows(
     input: &InputBundle,
     stage2: &Stage2Output,
@@ -55,20 +81,20 @@ pub fn build_pipeline_rows(
 ) -> Vec<PipelineCellRow> {
     let species = infer_species(input);
     let mut rows = Vec::with_capacity(input.barcodes.len());
-    let translation_cells: std::collections::BTreeMap<&str, &TranslationRegimeCell> =
-        stage_translation
-            .map(|s| s.cells.iter().map(|c| (c.cell_id.as_str(), c)).collect())
-            .unwrap_or_default();
+
+    let translation_cells: FxHashMap<&str, &TranslationRegimeCell> = stage_translation
+        .map(|s| s.cells.iter().map(|c| (c.cell_id.as_str(), c)).collect())
+        .unwrap_or_default();
 
     for i in 0..input.barcodes.len() {
-        let barcode = input.barcodes[i].clone();
-        let meta = input.metadata.as_ref().and_then(|m| m.rows.get(&barcode));
+        let barcode = &input.barcodes[i];
+        let meta = input.metadata.as_ref().and_then(|m| m.rows.get(barcode));
         let sample = meta
-            .and_then(|m| lookup_field(&m.fields, &["sample"]))
+            .and_then(|m| m.field("sample"))
             .unwrap_or("unknown")
             .to_string();
         let condition = meta
-            .and_then(|m| lookup_field(&m.fields, &["condition"]))
+            .and_then(|m| m.field("condition"))
             .unwrap_or("unknown")
             .to_string();
 
@@ -82,45 +108,46 @@ pub fn build_pipeline_rows(
 
         let regime = map_regime(stage4.classification[i].regime, translation_load);
 
-        let mut flags = Vec::new();
+        let mut flag_bits = 0u32;
         if stage4.classification[i].low_counts_cell {
-            flags.push("LOW_COUNTS_CELL");
+            flag_bits |= FLAG_LOW_COUNTS;
         }
         if stage4.classification[i].few_detected_genes {
-            flags.push("FEW_DETECTED_GENES");
+            flag_bits |= FLAG_FEW_DETECTED;
         }
         if stage2.axes[i].st_low_confidence {
-            flags.push("LOW_CONFIDENCE");
+            flag_bits |= FLAG_LOW_CONFIDENCE;
         }
-        if tcell.map(|c| c.low_confidence).unwrap_or(false) {
-            flags.push("LOW_CONFIDENCE");
-        }
-        if tcell.map(|c| c.translation_high).unwrap_or(false) {
-            flags.push("TRANSLATION_HIGH");
-        }
-        if tcell.map(|c| c.biogenesis_high).unwrap_or(false) {
-            flags.push("BIOGENESIS_HIGH");
-        }
-        if tcell.map(|c| c.isr_active).unwrap_or(false) {
-            flags.push("ISR_ACTIVE");
-        }
-        if tcell.map(|c| c.proteotoxic_risk).unwrap_or(false) {
-            flags.push("PROTEOTOXIC_RISK");
-        }
-        if tcell.map(|c| c.translational_stress_mode).unwrap_or(false) {
-            flags.push("TRANSLATIONAL_STRESS_MODE");
+        if let Some(c) = tcell {
+            if c.low_confidence {
+                flag_bits |= FLAG_LOW_CONFIDENCE;
+            }
+            if c.translation_high {
+                flag_bits |= FLAG_TRANSLATION_HIGH;
+            }
+            if c.biogenesis_high {
+                flag_bits |= FLAG_BIOGENESIS_HIGH;
+            }
+            if c.isr_active {
+                flag_bits |= FLAG_ISR_ACTIVE;
+            }
+            if c.proteotoxic_risk {
+                flag_bits |= FLAG_PROTEOTOXIC_RISK;
+            }
+            if c.translational_stress_mode {
+                flag_bits |= FLAG_TRANSLATIONAL_STRESS;
+            }
         }
         let low_ribo_signal = ribosome_density < 0.2;
         if low_ribo_signal {
-            flags.push("LOW_RIBO_SIGNAL");
+            flag_bits |= FLAG_LOW_RIBO_SIGNAL;
         }
         if stage3.scores[i].ras_red_flag {
-            flags.push("RAS_RED_FLAG");
+            flag_bits |= FLAG_RAS_RED_FLAG;
         }
-        flags.sort_unstable();
-        flags.dedup();
 
-        let has_low_confidence = flags.iter().any(|f| *f == "LOW_CONFIDENCE");
+        let flags = format_flags(flag_bits);
+        let has_low_confidence = flag_bits & FLAG_LOW_CONFIDENCE != 0;
 
         let confidence = calc_confidence(
             stage4.classification[i].low_counts_cell,
@@ -130,7 +157,7 @@ pub fn build_pipeline_rows(
         );
 
         rows.push(PipelineCellRow {
-            barcode,
+            barcode: barcode.clone(),
             sample,
             condition,
             species: species.to_string(),
@@ -160,7 +187,7 @@ pub fn build_pipeline_rows(
             proteotoxic_risk: tcell.map(|c| c.proteotoxic_risk).unwrap_or(false),
             translational_stress_mode: tcell.map(|c| c.translational_stress_mode).unwrap_or(false),
             regime,
-            flags: flags.join(","),
+            flags,
             confidence,
             has_low_confidence,
             has_low_ribo_signal: low_ribo_signal,
@@ -169,6 +196,24 @@ pub fn build_pipeline_rows(
 
     rows.sort_by(|a, b| a.barcode.cmp(&b.barcode));
     rows
+}
+
+fn format_flags(bits: u32) -> String {
+    if bits == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(64);
+    let mut first = true;
+    for (bit, name) in FLAGS {
+        if bits & bit != 0 {
+            if !first {
+                out.push(',');
+            }
+            out.push_str(name);
+            first = false;
+        }
+    }
+    out
 }
 
 fn calc_confidence(
@@ -210,20 +255,6 @@ fn map_regime(regime: TranslationRegime, translation_load: f64) -> &'static str 
     }
 }
 
-fn lookup_field<'a>(
-    fields: &'a std::collections::BTreeMap<String, String>,
-    names: &[&str],
-) -> Option<&'a str> {
-    for wanted in names {
-        for (k, v) in fields {
-            if k.eq_ignore_ascii_case(wanted) {
-                return Some(v.as_str());
-            }
-        }
-    }
-    None
-}
-
 fn infer_species(input: &InputBundle) -> &'static str {
     let mut human_like = 0usize;
     let mut mouse_like = 0usize;
@@ -233,18 +264,25 @@ fn infer_species(input: &InputBundle) -> &'static str {
         if raw.is_empty() {
             continue;
         }
-        if raw
-            .chars()
-            .all(|c| !c.is_ascii_alphabetic() || c.is_ascii_uppercase())
-        {
+        let bytes = raw.as_bytes();
+        let mut is_all_upper = true;
+        let mut first_upper = false;
+        let mut any_lower_after_first = false;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b.is_ascii_alphabetic() {
+                if b.is_ascii_lowercase() {
+                    is_all_upper = false;
+                    if i > 0 {
+                        any_lower_after_first = true;
+                    }
+                } else if i == 0 {
+                    first_upper = true;
+                }
+            }
+        }
+        if is_all_upper {
             human_like += 1;
-        } else if raw
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_uppercase())
-            .unwrap_or(false)
-            && raw.chars().skip(1).any(|c| c.is_ascii_lowercase())
-        {
+        } else if first_upper && any_lower_after_first {
             mouse_like += 1;
         }
     }
@@ -258,6 +296,7 @@ fn infer_species(input: &InputBundle) -> &'static str {
     }
 }
 
+#[inline]
 fn nan_to_zero(v: f64) -> f64 {
     if v.is_nan() { 0.0 } else { v }
 }

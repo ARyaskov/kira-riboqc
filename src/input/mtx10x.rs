@@ -1,12 +1,11 @@
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
-use flate2::read::GzDecoder;
 use kira_scio::api::{Reader, ReaderOptions};
 use kira_scio::detect::DetectedFormat;
+use kira_scio::model::CanonicalData;
 
 use super::InputError;
+use super::gene_index::FeatureRow;
 
 #[derive(Debug, Clone)]
 pub struct CscMatrix {
@@ -17,54 +16,42 @@ pub struct CscMatrix {
     pub values: Vec<u32>,
 }
 
-pub fn open_maybe_gz(path: &Path) -> Result<Box<dyn Read>, InputError> {
-    let file = File::open(path)?;
-    if path.extension().map(|ext| ext == "gz").unwrap_or(false) {
-        Ok(Box::new(GzDecoder::new(file)))
-    } else {
-        Ok(Box::new(file))
-    }
+pub struct MtxDataset {
+    pub matrix: CscMatrix,
+    pub barcodes: Vec<String>,
+    pub features: Vec<FeatureRow>,
 }
 
-pub fn load_barcodes(path: &Path) -> Result<Vec<String>, InputError> {
-    let md = Reader::with_options(
-        path,
+pub fn load_mtx_dataset(input_path: &Path) -> Result<MtxDataset, InputError> {
+    let canonical = Reader::with_options(
+        input_path,
         ReaderOptions {
             force_format: Some(DetectedFormat::Mtx10x),
             strict: true,
         },
     )
-    .read_metadata()
+    .read_all()
     .map_err(|e| InputError::Parse(e.message))?;
-    Ok(md.barcodes)
+
+    canonical_into_dataset(canonical)
 }
 
-pub fn load_mtx(path: &Path) -> Result<CscMatrix, InputError> {
-    let matrix = Reader::with_options(
-        path,
-        ReaderOptions {
-            force_format: Some(DetectedFormat::Mtx10x),
-            strict: true,
-        },
-    )
-    .read_matrix()
-    .map_err(|e| InputError::Parse(e.message))?;
+fn canonical_into_dataset(canonical: CanonicalData) -> Result<MtxDataset, InputError> {
+    let CanonicalData { metadata, matrix } = canonical;
 
     let n_rows = u32::try_from(matrix.n_genes)
         .map_err(|_| InputError::Parse("n_rows exceeds u32".to_string()))?;
     let n_cols = u32::try_from(matrix.n_cells)
         .map_err(|_| InputError::Parse("n_cols exceeds u32".to_string()))?;
 
-    let col_ptr = matrix
-        .col_ptr
-        .into_iter()
-        .map(|v| u32::try_from(v).map_err(|_| InputError::Parse("col_ptr exceeds u32".to_string())))
-        .collect::<Result<Vec<_>, _>>()?;
-    let row_idx = matrix
-        .row_idx
-        .into_iter()
-        .map(|v| u32::try_from(v).map_err(|_| InputError::Parse("row_idx exceeds u32".to_string())))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut col_ptr = Vec::with_capacity(matrix.col_ptr.len());
+    for v in &matrix.col_ptr {
+        col_ptr.push(
+            u32::try_from(*v).map_err(|_| InputError::Parse("col_ptr exceeds u32".to_string()))?,
+        );
+    }
+
+    let row_idx = matrix.row_idx;
 
     let mut values = Vec::with_capacity(matrix.values.len());
     for v in matrix.values {
@@ -81,11 +68,27 @@ pub fn load_mtx(path: &Path) -> Result<CscMatrix, InputError> {
         values.push(v as u32);
     }
 
-    Ok(CscMatrix {
+    let csc = CscMatrix {
         n_rows,
         n_cols,
         col_ptr,
         row_idx,
         values,
+    };
+
+    let mut features = Vec::with_capacity(metadata.gene_symbols.len());
+    for (idx, symbol) in metadata.gene_symbols.iter().enumerate() {
+        let raw_id = metadata
+            .gene_ids
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| format!("GENE_{}", idx + 1));
+        features.push(FeatureRow::from_raw(raw_id, symbol.clone()));
+    }
+
+    Ok(MtxDataset {
+        matrix: csc,
+        barcodes: metadata.barcodes,
+        features,
     })
 }

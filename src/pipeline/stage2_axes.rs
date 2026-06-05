@@ -1,10 +1,11 @@
+use rayon::prelude::*;
 use tracing::info;
 
-use crate::core::membership::MembershipVec;
-use crate::input::{InputBundle, SharedCacheData};
+use crate::core::{Acc, PanelBit, PanelMask, PanelMaskBuilder, median_non_nan};
+use crate::input::{InputBundle, MatrixSource};
 use crate::model::axes::{
     BG_TOP_K, CHAPERONE, LUXURY, MACHINERY, METAB, OFFSET, RQC_MACH, RRNA_PROXY, SCALE, STRESS,
-    UBIQUITIN, clamp_to_minus1_plus1, clamp01, is_mito, is_ribosomal, resolve_gene_set,
+    UBIQUITIN, clamp_to_minus1_plus1, clamp01, is_mito, is_ribosomal,
 };
 use crate::simd::ln1p_f64;
 
@@ -37,6 +38,19 @@ pub struct Stage2Output {
     pub axes: Vec<CellAxes>,
 }
 
+struct StageBits {
+    rp: PanelBit,
+    mach: PanelBit,
+    rrna: PanelBit,
+    stress: PanelBit,
+    metab: PanelBit,
+    luxury: PanelBit,
+    rqc: PanelBit,
+    chaperone: PanelBit,
+    ubiquitin: PanelBit,
+    bg: PanelBit,
+}
+
 pub fn run_stage2(input: &InputBundle) -> anyhow::Result<Stage2Output> {
     let _span = tracing::info_span!("stage2_axes").entered();
     info!("Stage 2 start");
@@ -45,133 +59,27 @@ pub fn run_stage2(input: &InputBundle) -> anyhow::Result<Stage2Output> {
     let n_cells = source.n_cols();
     let n_genes_unique = input.gene_index.genes.len();
 
-    let (libsize, detected_genes) = compute_cell_stats(&source);
-    let gene_detect_counts = compute_gene_detection_counts(input, &source, n_genes_unique);
-    let bg_gene_ids = select_background_genes(input, &gene_detect_counts, n_cells as u32);
+    let (libsize, detected_genes) = compute_cell_stats(&source, n_cells);
+    let gene_detect_counts = compute_gene_detection_counts(input, &source, n_cells, n_genes_unique);
+    let bg_gene_ids = select_background_genes(input, &gene_detect_counts);
 
-    let rp_gene_ids = collect_ribosomal_gene_ids(input);
-    let rrna_gene_ids = resolve_gene_set(&input.gene_index.map, RRNA_PROXY);
-    let mach_gene_ids = resolve_gene_set(&input.gene_index.map, MACHINERY);
-    let stress_gene_ids = resolve_gene_set(&input.gene_index.map, STRESS);
-    let metab_gene_ids = resolve_gene_set(&input.gene_index.map, METAB);
-    let luxury_gene_ids = resolve_gene_set(&input.gene_index.map, LUXURY);
-    let rqc_gene_ids = resolve_gene_set(&input.gene_index.map, RQC_MACH);
-    let chaperone_gene_ids = resolve_gene_set(&input.gene_index.map, CHAPERONE);
-    let ubiquitin_gene_ids = resolve_gene_set(&input.gene_index.map, UBIQUITIN);
+    let (mask, bits) = build_stage_mask(input, &bg_gene_ids, n_genes_unique);
+    let row_to_gene = input.gene_index.row_to_gene.as_slice();
 
-    let rp_mem = MembershipVec::from_gene_ids(&rp_gene_ids, n_genes_unique);
-    let rrna_mem = MembershipVec::from_gene_ids(&rrna_gene_ids, n_genes_unique);
-    let mach_mem = MembershipVec::from_gene_ids(&mach_gene_ids, n_genes_unique);
-    let stress_mem = MembershipVec::from_gene_ids(&stress_gene_ids, n_genes_unique);
-    let metab_mem = MembershipVec::from_gene_ids(&metab_gene_ids, n_genes_unique);
-    let luxury_mem = MembershipVec::from_gene_ids(&luxury_gene_ids, n_genes_unique);
-    let rqc_mem = MembershipVec::from_gene_ids(&rqc_gene_ids, n_genes_unique);
-    let chaperone_mem = MembershipVec::from_gene_ids(&chaperone_gene_ids, n_genes_unique);
-    let ubiquitin_mem = MembershipVec::from_gene_ids(&ubiquitin_gene_ids, n_genes_unique);
-    let bg_mem = MembershipVec::from_gene_ids(&bg_gene_ids, n_genes_unique);
+    let results: Vec<(CellAxisComponents, CellAxes)> = (0..n_cells)
+        .into_par_iter()
+        .map(|col| compute_cell(&source, col, libsize[col], row_to_gene, &mask, &bits))
+        .collect();
 
     let mut components = Vec::with_capacity(n_cells);
     let mut axes = Vec::with_capacity(n_cells);
     let mut st_low_conf_count: u32 = 0;
-
-    for col in 0..n_cells {
-        let col_view = source.column_view(col);
-        let ls = libsize[col];
-
-        let mut acc_rp = Acc::default();
-        let mut acc_mach = Acc::default();
-        let mut acc_rrna = Acc::default();
-        let mut acc_stress = Acc::default();
-        let mut acc_metab = Acc::default();
-        let mut acc_luxury = Acc::default();
-        let mut acc_rqc = Acc::default();
-        let mut acc_chaperone = Acc::default();
-        let mut acc_ubiquitin = Acc::default();
-        let mut acc_bg = Acc::default();
-
-        let denom = if ls == 0 { 1.0 } else { ls as f64 };
-        for (gid, val) in col_view.iter(input.gene_index.row_to_gene.as_slice()) {
-            let cpm = 1_000_000.0 * (val as f64) / denom;
-            let x = ln1p_f64(cpm);
-
-            if rp_mem.contains(gid) {
-                acc_rp.add(x);
-            }
-            if mach_mem.contains(gid) {
-                acc_mach.add(x);
-            }
-            if rrna_mem.contains(gid) {
-                acc_rrna.add(x);
-            }
-            if stress_mem.contains(gid) {
-                acc_stress.add(x);
-            }
-            if metab_mem.contains(gid) {
-                acc_metab.add(x);
-            }
-            if luxury_mem.contains(gid) {
-                acc_luxury.add(x);
-            }
-            if rqc_mem.contains(gid) {
-                acc_rqc.add(x);
-            }
-            if chaperone_mem.contains(gid) {
-                acc_chaperone.add(x);
-            }
-            if ubiquitin_mem.contains(gid) {
-                acc_ubiquitin.add(x);
-            }
-            if bg_mem.contains(gid) {
-                acc_bg.add(x);
-            }
-        }
-
-        let bg_mean = acc_bg.mean();
-        let rp = enrich(acc_rp.mean(), bg_mean);
-        let mach = enrich(acc_mach.mean(), bg_mean);
-        let rrna_proxy = enrich(acc_rrna.mean(), bg_mean);
-        let stress = enrich(acc_stress.mean(), bg_mean);
-        let metab = enrich(acc_metab.mean(), bg_mean);
-        let luxury_raw = enrich(acc_luxury.mean(), bg_mean);
-        let rqc_mach = enrich(acc_rqc.mean(), bg_mean);
-        let chaperone = enrich(acc_chaperone.mean(), bg_mean);
-        let ubiquitin = enrich(acc_ubiquitin.mean(), bg_mean);
-
-        let luxury = if luxury_raw.is_nan() {
-            None
-        } else {
-            Some(luxury_raw)
-        };
-
-        let (tl, _missing_component) = compute_tl(rp, mach, rrna_proxy);
-        let (st, st_low_confidence) = compute_st(stress, metab, luxury);
-        let (rqc, rqc_pressure) = compute_rqc(rqc_mach, stress, rp);
-        let tpc = compute_tpc(chaperone, ubiquitin, tl);
-
-        if st_low_confidence {
+    for (comp, ax) in results {
+        if ax.st_low_confidence {
             st_low_conf_count += 1;
         }
-
-        components.push(CellAxisComponents {
-            rp,
-            mach,
-            rrna_proxy,
-            stress,
-            metab,
-            luxury,
-            rqc_mach,
-            chaperone,
-            ubiquitin,
-        });
-
-        axes.push(CellAxes {
-            tl,
-            st,
-            rqc,
-            rqc_pressure,
-            tpc,
-            st_low_confidence,
-        });
+        components.push(comp);
+        axes.push(ax);
     }
 
     let tl_median = median_non_nan(axes.iter().map(|a| a.tl));
@@ -201,100 +109,117 @@ pub fn run_stage2(input: &InputBundle) -> anyhow::Result<Stage2Output> {
     })
 }
 
-#[derive(Clone, Copy)]
-struct ColumnView<'a> {
-    row_idx: &'a [u32],
-    values: &'a [u32],
-}
+fn build_stage_mask(
+    input: &InputBundle,
+    bg_gene_ids: &[u32],
+    n_genes_unique: usize,
+) -> (PanelMask, StageBits) {
+    let rp_ids: Vec<u32> = input
+        .gene_index
+        .genes
+        .iter()
+        .filter(|g| is_ribosomal(&g.symbol))
+        .map(|g| g.gene_id)
+        .collect();
 
-impl<'a> ColumnView<'a> {
-    fn iter(self, row_to_gene: &'a [u32]) -> impl Iterator<Item = (u32, u32)> + 'a {
-        self.row_idx
+    let map = &input.gene_index.map;
+    let resolve = |symbols: &[&str]| -> Vec<u32> {
+        symbols
             .iter()
-            .zip(self.values.iter())
-            .map(move |(row, val)| (row_to_gene[*row as usize], *val))
-    }
+            .filter_map(|s| map.get(*s).copied())
+            .collect()
+    };
+
+    let mut builder = PanelMaskBuilder::new(n_genes_unique);
+    let bits = StageBits {
+        rp: builder.add_panel(&rp_ids),
+        mach: builder.add_panel(&resolve(MACHINERY)),
+        rrna: builder.add_panel(&resolve(RRNA_PROXY)),
+        stress: builder.add_panel(&resolve(STRESS)),
+        metab: builder.add_panel(&resolve(METAB)),
+        luxury: builder.add_panel(&resolve(LUXURY)),
+        rqc: builder.add_panel(&resolve(RQC_MACH)),
+        chaperone: builder.add_panel(&resolve(CHAPERONE)),
+        ubiquitin: builder.add_panel(&resolve(UBIQUITIN)),
+        bg: builder.add_panel(bg_gene_ids),
+    };
+    (builder.build(), bits)
 }
 
-enum MatrixSource<'a> {
-    Matrix {
-        col_ptr: &'a [u32],
-        row_idx: &'a [u32],
-        values: &'a [u32],
-        n_cols: usize,
-    },
-    Cache(&'a SharedCacheData),
-}
+fn compute_cell(
+    source: &MatrixSource<'_>,
+    col: usize,
+    libsize: u64,
+    row_to_gene: &[u32],
+    mask: &PanelMask,
+    bits: &StageBits,
+) -> (CellAxisComponents, CellAxes) {
+    let col_view = source.column(col);
+    let denom = if libsize == 0 { 1.0 } else { libsize as f64 };
 
-impl<'a> MatrixSource<'a> {
-    fn from_input(input: &'a InputBundle) -> Self {
-        if let Some(cache) = input.shared_cache.as_ref() {
-            Self::Cache(cache)
-        } else {
-            Self::Matrix {
-                col_ptr: &input.matrix.col_ptr,
-                row_idx: &input.matrix.row_idx,
-                values: &input.matrix.values,
-                n_cols: input.matrix.n_cols as usize,
-            }
+    let mut accs = [Acc::default(); 10];
+
+    for (gid, val) in col_view.iter_genes(row_to_gene) {
+        let m = mask.get(gid);
+        if m == 0 {
+            continue;
+        }
+        let cpm = 1_000_000.0 * (val as f64) / denom;
+        let x = ln1p_f64(cpm);
+        let mut bits_left = m;
+        while bits_left != 0 {
+            let lo = bits_left.trailing_zeros() as usize;
+            accs[lo].add(x);
+            bits_left &= bits_left - 1;
         }
     }
 
-    fn n_cols(&self) -> usize {
-        match self {
-            MatrixSource::Matrix { n_cols, .. } => *n_cols,
-            MatrixSource::Cache(cache) => cache.n_cells as usize,
-        }
-    }
+    let bg_mean = accs[bits.bg.index].mean();
+    let rp = enrich(accs[bits.rp.index].mean(), bg_mean);
+    let mach = enrich(accs[bits.mach.index].mean(), bg_mean);
+    let rrna_proxy = enrich(accs[bits.rrna.index].mean(), bg_mean);
+    let stress = enrich(accs[bits.stress.index].mean(), bg_mean);
+    let metab = enrich(accs[bits.metab.index].mean(), bg_mean);
+    let luxury_raw = enrich(accs[bits.luxury.index].mean(), bg_mean);
+    let rqc_mach = enrich(accs[bits.rqc.index].mean(), bg_mean);
+    let chaperone = enrich(accs[bits.chaperone.index].mean(), bg_mean);
+    let ubiquitin = enrich(accs[bits.ubiquitin.index].mean(), bg_mean);
 
-    fn column_view(&self, col: usize) -> ColumnView<'_> {
-        match self {
-            MatrixSource::Matrix {
-                col_ptr,
-                row_idx,
-                values,
-                ..
-            } => {
-                let start = col_ptr[col] as usize;
-                let end = col_ptr[col + 1] as usize;
-                ColumnView {
-                    row_idx: &row_idx[start..end],
-                    values: &values[start..end],
-                }
-            }
-            MatrixSource::Cache(cache) => {
-                let start = cache.col_ptr[col] as usize;
-                let end = cache.col_ptr[col + 1] as usize;
-                ColumnView {
-                    row_idx: &cache.row_idx[start..end],
-                    values: &cache.values_u32[start..end],
-                }
-            }
-        }
-    }
+    let luxury = if luxury_raw.is_nan() {
+        None
+    } else {
+        Some(luxury_raw)
+    };
+
+    let (tl, _missing_component) = compute_tl(rp, mach, rrna_proxy);
+    let (st, st_low_confidence) = compute_st(stress, metab, luxury);
+    let (rqc, rqc_pressure) = compute_rqc(rqc_mach, stress, rp);
+    let tpc = compute_tpc(chaperone, ubiquitin, tl);
+
+    (
+        CellAxisComponents {
+            rp,
+            mach,
+            rrna_proxy,
+            stress,
+            metab,
+            luxury,
+            rqc_mach,
+            chaperone,
+            ubiquitin,
+        },
+        CellAxes {
+            tl,
+            st,
+            rqc,
+            rqc_pressure,
+            tpc,
+            st_low_confidence,
+        },
+    )
 }
 
-#[derive(Default)]
-struct Acc {
-    sum: f64,
-    count: u32,
-}
-
-impl Acc {
-    fn add(&mut self, x: f64) {
-        self.sum += x;
-        self.count += 1;
-    }
-
-    fn mean(&self) -> f64 {
-        if self.count == 0 {
-            f64::NAN
-        } else {
-            self.sum / (self.count as f64)
-        }
-    }
-}
-
+#[inline]
 fn enrich(set_mean: f64, bg_mean: f64) -> f64 {
     if set_mean.is_nan() || bg_mean.is_nan() {
         return f64::NAN;
@@ -305,27 +230,22 @@ fn enrich(set_mean: f64, bg_mean: f64) -> f64 {
 }
 
 fn compute_tl(rp: f64, mach: f64, rrna_proxy: f64) -> (f64, bool) {
-    let mut missing_component = false;
-    let rp_val = if rp.is_nan() {
-        missing_component = true;
+    let mut missing = false;
+    let rp_v = nan_to_zero(rp, &mut missing);
+    let mach_v = nan_to_zero(mach, &mut missing);
+    let rrna_v = nan_to_zero(rrna_proxy, &mut missing);
+    let tl = clamp01(0.5 * rp_v + 0.3 * mach_v + 0.2 * rrna_v);
+    (tl, missing)
+}
+
+#[inline]
+fn nan_to_zero(x: f64, missing: &mut bool) -> f64 {
+    if x.is_nan() {
+        *missing = true;
         0.0
     } else {
-        rp
-    };
-    let mach_val = if mach.is_nan() {
-        missing_component = true;
-        0.0
-    } else {
-        mach
-    };
-    let rrna_val = if rrna_proxy.is_nan() {
-        missing_component = true;
-        0.0
-    } else {
-        rrna_proxy
-    };
-    let tl = clamp01(0.5 * rp_val + 0.3 * mach_val + 0.2 * rrna_val);
-    (tl, missing_component)
+        x
+    }
 }
 
 fn compute_st(stress: f64, metab: f64, luxury: Option<f64>) -> (f64, bool) {
@@ -353,97 +273,78 @@ fn compute_tpc(chaperone: f64, ubiquitin: f64, tl: f64) -> f64 {
     clamp_to_minus1_plus1(deg_cap - tl)
 }
 
-fn compute_cell_stats(source: &MatrixSource<'_>) -> (Vec<u64>, Vec<u32>) {
-    let n_cells = source.n_cols();
-    let mut libsize = vec![0u64; n_cells];
-    let mut detected = vec![0u32; n_cells];
+fn compute_cell_stats(source: &MatrixSource<'_>, n_cells: usize) -> (Vec<u64>, Vec<u32>) {
+    let stats: Vec<(u64, u32)> = (0..n_cells)
+        .into_par_iter()
+        .map(|col| {
+            let view = source.column(col);
+            let sum: u64 = view.values.iter().map(|v| *v as u64).sum();
+            (sum, view.values.len() as u32)
+        })
+        .collect();
 
-    for col in 0..n_cells {
-        let view = source.column_view(col);
-        let mut sum = 0u64;
-        for val in view.values {
-            sum += *val as u64;
-        }
-        libsize[col] = sum;
-        detected[col] = view.values.len() as u32;
+    let mut libsize = Vec::with_capacity(n_cells);
+    let mut detected = Vec::with_capacity(n_cells);
+    for (s, d) in stats {
+        libsize.push(s);
+        detected.push(d);
     }
-
     (libsize, detected)
 }
 
 fn compute_gene_detection_counts(
     input: &InputBundle,
     source: &MatrixSource<'_>,
+    n_cells: usize,
     n_genes_unique: usize,
 ) -> Vec<u32> {
-    let n_cells = source.n_cols();
-    let mut counts = vec![0u32; n_genes_unique];
-    let mut last_seen = vec![u32::MAX; n_genes_unique];
+    let row_to_gene = input.gene_index.row_to_gene.as_slice();
+    let has_dups = !input.gene_index.duplicates.is_empty();
 
+    let mut counts = vec![0u32; n_genes_unique];
+
+    if !has_dups {
+        for col in 0..n_cells {
+            let view = source.column(col);
+            for row in view.row_idx {
+                counts[*row as usize] += 1;
+            }
+        }
+        return counts;
+    }
+
+    let mut last_seen = vec![u32::MAX; n_genes_unique];
     for col in 0..n_cells {
-        let view = source.column_view(col);
+        let col_marker = col as u32;
+        let view = source.column(col);
         for row in view.row_idx {
-            let gene_id = input.gene_index.row_to_gene[*row as usize] as usize;
-            if last_seen[gene_id] != col as u32 {
-                last_seen[gene_id] = col as u32;
+            let gene_id = row_to_gene[*row as usize] as usize;
+            if last_seen[gene_id] != col_marker {
+                last_seen[gene_id] = col_marker;
                 counts[gene_id] += 1;
             }
         }
     }
-
     counts
 }
 
-fn select_background_genes(input: &InputBundle, counts: &[u32], n_cells: u32) -> Vec<u32> {
-    let mut candidates: Vec<(u32, u32)> = Vec::new();
-
+fn select_background_genes(input: &InputBundle, counts: &[u32]) -> Vec<u32> {
+    let mut candidates: Vec<(u32, u32)> = Vec::with_capacity(input.gene_index.genes.len());
     for (gene_id, gene) in input.gene_index.genes.iter().enumerate() {
-        let symbol = gene.symbol.as_str();
-        if is_ribosomal(symbol) || is_mito(symbol) {
+        if is_ribosomal(&gene.symbol) || is_mito(&gene.symbol) {
             continue;
         }
-        let count = counts[gene_id];
-        if n_cells == 0 {
-            continue;
-        }
-        candidates.push((gene_id as u32, count));
+        candidates.push((gene_id as u32, counts[gene_id]));
     }
 
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-
-    let mut bg_gene_ids: Vec<u32> = candidates
-        .iter()
-        .take(BG_TOP_K)
-        .map(|(gid, _)| *gid)
-        .collect();
-
+    let take = BG_TOP_K.min(candidates.len());
+    if take == 0 {
+        return Vec::new();
+    }
+    if take < candidates.len() {
+        candidates.select_nth_unstable_by(take - 1, |a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    }
+    let mut bg_gene_ids: Vec<u32> = candidates.iter().take(take).map(|(gid, _)| *gid).collect();
     bg_gene_ids.sort_unstable();
     bg_gene_ids
-}
-
-fn collect_ribosomal_gene_ids(input: &InputBundle) -> Vec<u32> {
-    let mut ids = Vec::new();
-    for entry in &input.gene_index.genes {
-        if is_ribosomal(&entry.symbol) {
-            ids.push(entry.gene_id);
-        }
-    }
-    ids
-}
-
-fn median_non_nan<I>(iter: I) -> f64
-where
-    I: Iterator<Item = f64>,
-{
-    let mut values: Vec<f64> = iter.filter(|v| !v.is_nan()).collect();
-    if values.is_empty() {
-        return f64::NAN;
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mid = values.len() / 2;
-    if values.len() % 2 == 1 {
-        values[mid]
-    } else {
-        (values[mid - 1] + values[mid]) / 2.0
-    }
 }

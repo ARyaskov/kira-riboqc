@@ -78,14 +78,14 @@ fn shared_cache_read_valid_and_traversal() {
     );
 
     let cache = read_shared_cache(&cache_path).unwrap();
-    assert_eq!(cache.n_genes, 3);
-    assert_eq!(cache.n_cells, 2);
-    assert_eq!(cache.nnz, 3);
-    assert_eq!(cache.genes, vec!["RPLP0", "EEF2", "ATF4"]);
-    assert_eq!(cache.barcodes, vec!["C1", "C2"]);
-    assert_eq!(cache.col_ptr, vec![0, 2, 3]);
-    assert_eq!(cache.row_idx, vec![0, 2, 1]);
-    assert_eq!(cache.values_u32, vec![5, 1, 7]);
+    assert_eq!(cache.n_genes(), 3);
+    assert_eq!(cache.n_cells(), 2);
+    assert_eq!(cache.nnz(), 3);
+    assert_eq!(cache.genes(), &["RPLP0", "EEF2", "ATF4"]);
+    assert_eq!(cache.barcodes(), &["C1", "C2"]);
+    assert_eq!(cache.col_ptr(), &[0, 2, 3]);
+    assert_eq!(cache.row_idx(), &[0, 2, 1]);
+    assert_eq!(cache.values_u32(), &[5, 1, 7]);
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn shared_cache_header_crc_validation() {
 
     assert!(read_shared_cache(&cache_ok).is_ok());
     let err = read_shared_cache(&cache_bad).unwrap_err();
-    assert!(err.to_string().contains("CRC"));
+    assert!(err.to_string().to_ascii_lowercase().contains("crc"));
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn pipeline_cache_invalid_is_hard_error() {
     };
 
     let err = run_stage1(&args).unwrap_err();
-    assert!(err.to_string().contains("CRC"));
+    assert!(err.to_string().to_ascii_lowercase().contains("crc"));
 }
 
 fn write_valid_cache(

@@ -1,20 +1,31 @@
-use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use csv::ReaderBuilder;
+use flate2::read::GzDecoder;
+use rustc_hash::FxHashMap;
 
 use super::InputError;
-use super::mtx10x::open_maybe_gz;
 
 #[derive(Debug, Clone)]
 pub struct CellMeta {
     pub cell_id: String,
-    pub fields: BTreeMap<String, String>,
+    pub fields: FxHashMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+impl CellMeta {
+    pub fn field(&self, key: &str) -> Option<&str> {
+        self.fields
+            .get(&key.to_ascii_lowercase())
+            .map(String::as_str)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct MetadataTable {
-    pub rows: BTreeMap<String, CellMeta>,
+    pub rows: FxHashMap<String, CellMeta>,
+    pub header_keys_lower: Vec<String>,
 }
 
 pub fn load_metadata(path: &Path) -> Result<MetadataTable, InputError> {
@@ -33,8 +44,7 @@ pub fn load_metadata(path: &Path) -> Result<MetadataTable, InputError> {
         Ok(table) => Ok(table),
         Err(err) => {
             if let Some(fallback_delim) = fallback {
-                let table = load_metadata_with_delim(path, fallback_delim)?;
-                Ok(table)
+                load_metadata_with_delim(path, fallback_delim)
             } else {
                 Err(err)
             }
@@ -42,8 +52,23 @@ pub fn load_metadata(path: &Path) -> Result<MetadataTable, InputError> {
     }
 }
 
+fn open_buffered(path: &Path) -> Result<BufReader<Box<dyn Read>>, InputError> {
+    let file = File::open(path)?;
+    let raw: Box<dyn Read> = if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("gz"))
+        .unwrap_or(false)
+    {
+        Box::new(GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+    Ok(BufReader::with_capacity(64 * 1024, raw))
+}
+
 fn load_metadata_with_delim(path: &Path, delim: u8) -> Result<MetadataTable, InputError> {
-    let reader = open_maybe_gz(path)?;
+    let reader = open_buffered(path)?;
     let mut rdr = ReaderBuilder::new().delimiter(delim).from_reader(reader);
 
     let headers = rdr
@@ -56,23 +81,20 @@ fn load_metadata_with_delim(path: &Path, delim: u8) -> Result<MetadataTable, Inp
         ));
     }
 
-    let mut cell_id_idx: Option<usize> = None;
-    let mut barcode_idx: Option<usize> = None;
-    for (i, h) in headers.iter().enumerate() {
-        let key = h.trim().to_ascii_lowercase();
-        if key == "cell_id" {
-            cell_id_idx = Some(i);
-        }
-        if key == "barcode" {
-            barcode_idx = Some(i);
-        }
-    }
+    let header_keys_lower: Vec<String> = headers
+        .iter()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .collect();
 
-    let id_idx = cell_id_idx.or(barcode_idx).ok_or_else(|| {
-        InputError::Metadata("metadata must have a cell_id or barcode column".to_string())
-    })?;
+    let id_idx = header_keys_lower
+        .iter()
+        .position(|k| k == "cell_id")
+        .or_else(|| header_keys_lower.iter().position(|k| k == "barcode"))
+        .ok_or_else(|| {
+            InputError::Metadata("metadata must have a cell_id or barcode column".to_string())
+        })?;
 
-    let mut rows: BTreeMap<String, CellMeta> = BTreeMap::new();
+    let mut rows: FxHashMap<String, CellMeta> = FxHashMap::default();
     for result in rdr.records() {
         let record =
             result.map_err(|e| InputError::Metadata(format!("failed to read record: {e}")))?;
@@ -80,22 +102,24 @@ fn load_metadata_with_delim(path: &Path, delim: u8) -> Result<MetadataTable, Inp
         if cell_id.is_empty() {
             continue;
         }
-
         if rows.contains_key(&cell_id) {
             continue;
         }
 
-        let mut fields = BTreeMap::new();
-        for (i, header) in headers.iter().enumerate() {
+        let mut fields = FxHashMap::default();
+        for (i, key_lower) in header_keys_lower.iter().enumerate() {
             if i == id_idx {
                 continue;
             }
             let value = record.get(i).unwrap_or("");
-            fields.insert(header.to_string(), value.to_string());
+            fields.insert(key_lower.clone(), value.to_string());
         }
 
         rows.insert(cell_id.clone(), CellMeta { cell_id, fields });
     }
 
-    Ok(MetadataTable { rows })
+    Ok(MetadataTable {
+        rows,
+        header_keys_lower,
+    })
 }

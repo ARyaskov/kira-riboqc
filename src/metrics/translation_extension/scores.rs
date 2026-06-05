@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use crate::core::math::{median as math_median, median_sorted, percentile_sorted};
 
 pub const TRIM_FRAC: f64 = 0.10;
 pub const MAD_SCALE: f64 = 1.4826;
@@ -68,7 +68,7 @@ pub fn trimmed_mean(values: &[f64], min_genes: usize) -> f64 {
         return f64::NAN;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(total_cmp);
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let trim = ((sorted.len() as f64) * TRIM_FRAC).floor() as usize;
     let start = trim.min(sorted.len());
     let end = sorted.len().saturating_sub(trim);
@@ -87,12 +87,12 @@ pub fn robust_baseline(panel_cores: &[PanelCore]) -> RobustBaseline {
     let isr = collect_finite(panel_cores.iter().map(|x| x.isr_core));
     let proteo = collect_finite(panel_cores.iter().map(|x| x.proteo_core));
 
-    let (ribosome_median, ribosome_mad) = median_and_mad(&ribosome);
-    let (initiation_median, initiation_mad) = median_and_mad(&initiation);
-    let (bio_median, bio_mad) = median_and_mad(&bio);
-    let (mtor_median, mtor_mad) = median_and_mad(&mtor);
-    let (isr_median, isr_mad) = median_and_mad(&isr);
-    let (proteo_median, proteo_mad) = median_and_mad(&proteo);
+    let (ribosome_median, ribosome_mad) = median_and_mad(ribosome);
+    let (initiation_median, initiation_mad) = median_and_mad(initiation);
+    let (bio_median, bio_mad) = median_and_mad(bio);
+    let (mtor_median, mtor_mad) = median_and_mad(mtor);
+    let (isr_median, isr_mad) = median_and_mad(isr);
+    let (proteo_median, proteo_mad) = median_and_mad(proteo);
 
     RobustBaseline {
         ribosome_median,
@@ -110,6 +110,7 @@ pub fn robust_baseline(panel_cores: &[PanelCore]) -> RobustBaseline {
     }
 }
 
+#[inline]
 pub fn robust_z(value: f64, median: f64, mad: f64) -> f64 {
     if value.is_nan() || median.is_nan() {
         return f64::NAN;
@@ -140,9 +141,9 @@ pub fn build_scores(core: PanelCore, baseline: &RobustBaseline) -> TranslationEx
         baseline.proteo_mad,
     );
 
-    let tpi = combine_weighted(&[(zr, 0.7), (zi, 0.3)]);
+    let tpi = combine2(zr, 0.7, zi, 0.3);
     let rbl = zbio;
-    let mtor_p = combine_weighted(&[(zmtor, 0.6), (zr, 0.4)]);
+    let mtor_p = combine2(zmtor, 0.6, zr, 0.4);
     let isr_a = zisr;
     let tpib = if zp.is_nan() {
         if tpi.is_nan() { f64::NAN } else { tpi.max(0.0) }
@@ -151,7 +152,7 @@ pub fn build_scores(core: PanelCore, baseline: &RobustBaseline) -> TranslationEx
     } else {
         (tpi - zp).max(0.0)
     };
-    let tsm = combine_weighted(&[(tpi, 0.5), (isr_a, 0.3), (tpib, 0.2)]);
+    let tsm = combine3(tpi, 0.5, isr_a, 0.3, tpib, 0.2);
 
     TranslationExtensionCellScores {
         ribosome_core: core.ribosome_core,
@@ -181,17 +182,7 @@ pub fn build_scores(core: PanelCore, baseline: &RobustBaseline) -> TranslationEx
 }
 
 pub fn median(values: &[f64]) -> f64 {
-    let mut sorted = values.to_vec();
-    if sorted.is_empty() {
-        return f64::NAN;
-    }
-    sorted.sort_by(total_cmp);
-    let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
-        (sorted[mid - 1] + sorted[mid]) * 0.5
-    } else {
-        sorted[mid]
-    }
+    math_median(values)
 }
 
 pub fn percentile(values: &[f64], p: f64) -> f64 {
@@ -199,26 +190,24 @@ pub fn percentile(values: &[f64], p: f64) -> f64 {
         return f64::NAN;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(total_cmp);
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     percentile_sorted(&sorted, p)
 }
 
-fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
-    let rank = (p * sorted.len() as f64).ceil() as usize;
-    let idx = if rank == 0 { 0 } else { rank - 1 };
-    sorted[idx.min(sorted.len() - 1)]
-}
-
-fn median_and_mad(values: &[f64]) -> (f64, f64) {
+fn median_and_mad(mut values: Vec<f64>) -> (f64, f64) {
     if values.is_empty() {
         return (f64::NAN, f64::NAN);
     }
-    let med = median(values);
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = median_sorted(&values);
     if med.is_nan() {
         return (f64::NAN, f64::NAN);
     }
-    let deviations: Vec<f64> = values.iter().map(|v| (v - med).abs()).collect();
-    let mad = median(&deviations);
+    for v in values.iter_mut() {
+        *v = (*v - med).abs();
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mad = median_sorted(&values);
     (med, mad)
 }
 
@@ -229,22 +218,36 @@ where
     iter.filter(|v| v.is_finite()).collect()
 }
 
-fn combine_weighted(parts: &[(f64, f64)]) -> f64 {
-    let mut weighted_sum = 0.0;
-    let mut weight_sum = 0.0;
-    for (value, weight) in parts {
-        if value.is_finite() {
-            weighted_sum += value * weight;
-            weight_sum += weight;
-        }
+#[inline]
+fn combine2(a: f64, wa: f64, b: f64, wb: f64) -> f64 {
+    let mut ws = 0.0;
+    let mut s = 0.0;
+    if a.is_finite() {
+        s += a * wa;
+        ws += wa;
     }
-    if weight_sum == 0.0 {
-        f64::NAN
-    } else {
-        weighted_sum / weight_sum
+    if b.is_finite() {
+        s += b * wb;
+        ws += wb;
     }
+    if ws == 0.0 { f64::NAN } else { s / ws }
 }
 
-fn total_cmp(a: &f64, b: &f64) -> Ordering {
-    a.partial_cmp(b).unwrap_or(Ordering::Equal)
+#[inline]
+fn combine3(a: f64, wa: f64, b: f64, wb: f64, c: f64, wc: f64) -> f64 {
+    let mut ws = 0.0;
+    let mut s = 0.0;
+    if a.is_finite() {
+        s += a * wa;
+        ws += wa;
+    }
+    if b.is_finite() {
+        s += b * wb;
+        ws += wb;
+    }
+    if c.is_finite() {
+        s += c * wc;
+        ws += wc;
+    }
+    if ws == 0.0 { f64::NAN } else { s / ws }
 }

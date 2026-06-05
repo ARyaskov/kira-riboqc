@@ -125,14 +125,9 @@ fn enrich(set_mean: f64, bg_mean: f64) -> f64 {
 
 fn clamp01(x: f64) -> f64 {
     if x.is_nan() {
-        return f64::NAN;
-    }
-    if x < 0.0 {
-        0.0
-    } else if x > 1.0 {
-        1.0
+        f64::NAN
     } else {
-        x
+        x.clamp(0.0, 1.0)
     }
 }
 

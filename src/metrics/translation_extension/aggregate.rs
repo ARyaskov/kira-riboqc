@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::core::math::{round6_nan, round6_or_zero};
 use crate::input::MetadataTable;
 
 use super::panels::RIBO_EXTENSION_PANEL_V1;
@@ -213,12 +214,10 @@ fn top_clusters_by_stress_mode(
 fn infer_cluster(cell_id: &str, metadata: Option<&MetadataTable>) -> Option<String> {
     let meta = metadata.and_then(|m| m.rows.get(cell_id))?;
     for key in ["cluster", "seurat_clusters", "leiden", "louvain"] {
-        for (field_key, value) in &meta.fields {
-            if field_key.eq_ignore_ascii_case(key) {
-                let trimmed = value.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
+        if let Some(value) = meta.field(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
             }
         }
     }
@@ -281,7 +280,7 @@ fn frac(numerator: u64, denom: u64) -> f64 {
     if denom == 0 {
         0.0
     } else {
-        round6_or_nan(numerator as f64 / denom as f64)
+        round6_nan(numerator as f64 / denom as f64)
     }
 }
 
@@ -290,20 +289,4 @@ where
     I: Iterator<Item = f64>,
 {
     iter.filter(|v| v.is_finite()).collect()
-}
-
-fn round6_or_nan(value: f64) -> f64 {
-    if value.is_nan() {
-        f64::NAN
-    } else {
-        (value * 1_000_000.0).round() / 1_000_000.0
-    }
-}
-
-fn round6_or_zero(value: f64) -> f64 {
-    if value.is_nan() {
-        0.0
-    } else {
-        (value * 1_000_000.0).round() / 1_000_000.0
-    }
 }

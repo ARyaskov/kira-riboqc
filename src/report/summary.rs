@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+use crate::core::math::{percentile_sorted, round6};
 use crate::input::Stage1Stats;
 use crate::metrics::translation_extension::aggregate::TranslationExtensionSummary;
 use crate::pipeline::stage_translation_regime::StageTranslationRegimeOutput;
@@ -77,9 +78,20 @@ pub fn build_summary(
         .map(|r| r.species.clone())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let tl_vals: Vec<f64> = rows.iter().map(|r| r.translation_load).collect();
-    let rd_vals: Vec<f64> = rows.iter().map(|r| r.ribosome_density).collect();
-    let sti_vals: Vec<f64> = rows.iter().map(|r| r.stress_translation_index).collect();
+    let mut tl_vals = Vec::with_capacity(rows.len());
+    let mut rd_vals = Vec::with_capacity(rows.len());
+    let mut sti_vals = Vec::with_capacity(rows.len());
+    for r in rows {
+        if r.translation_load.is_finite() {
+            tl_vals.push(r.translation_load);
+        }
+        if r.ribosome_density.is_finite() {
+            rd_vals.push(r.ribosome_density);
+        }
+        if r.stress_translation_index.is_finite() {
+            sti_vals.push(r.stress_translation_index);
+        }
+    }
 
     let mut counts = BTreeMap::new();
     for regime in [
@@ -119,9 +131,9 @@ pub fn build_summary(
         },
         input: InputInfo { n_cells, species },
         distributions: Distributions {
-            translation_load: stat3(&tl_vals),
-            ribosome_density: stat3(&rd_vals),
-            stress_translation_index: stat3(&sti_vals),
+            translation_load: stat3(&mut tl_vals),
+            ribosome_density: stat3(&mut rd_vals),
+            stress_translation_index: stat3(&mut sti_vals),
         },
         regimes: Regimes { counts, fractions },
         qc: QcSummary {
@@ -145,7 +157,7 @@ pub fn build_summary(
     }
 }
 
-fn stat3(values: &[f64]) -> Stat3 {
+fn stat3(values: &mut [f64]) -> Stat3 {
     if values.is_empty() {
         return Stat3 {
             median: 0.0,
@@ -153,27 +165,10 @@ fn stat3(values: &[f64]) -> Stat3 {
             p99: 0.0,
         };
     }
-
-    let mut sorted = values
-        .iter()
-        .copied()
-        .map(|v| if v.is_finite() { v } else { 0.0 })
-        .collect::<Vec<_>>();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     Stat3 {
-        median: round6(percentile_sorted(&sorted, 0.50)),
-        p90: round6(percentile_sorted(&sorted, 0.90)),
-        p99: round6(percentile_sorted(&sorted, 0.99)),
+        median: round6(percentile_sorted(values, 0.50)),
+        p90: round6(percentile_sorted(values, 0.90)),
+        p99: round6(percentile_sorted(values, 0.99)),
     }
-}
-
-fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
-    let rank = (p * sorted.len() as f64).ceil() as usize;
-    let idx = if rank == 0 { 0 } else { rank - 1 };
-    sorted[idx.min(sorted.len() - 1)]
-}
-
-fn round6(x: f64) -> f64 {
-    (x * 1_000_000.0).round() / 1_000_000.0
 }

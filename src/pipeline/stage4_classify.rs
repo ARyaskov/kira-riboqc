@@ -29,7 +29,7 @@ pub fn classify_cell(axes: &CellAxes, _libsize: u64, _detected_genes: u32) -> Tr
         return TranslationRegime::TranslationSuppressed;
     }
 
-    if tl >= TL_MID_LOW && tl <= TL_MID_HIGH && rqc < RQC_MID && tpc >= TPC_NEG_SOFT {
+    if (TL_MID_LOW..=TL_MID_HIGH).contains(&tl) && rqc < RQC_MID && tpc >= TPC_NEG_SOFT {
         return TranslationRegime::EfficientTranslation;
     }
 
